@@ -208,6 +208,7 @@ namespace FixProject
             if (path != null)
             {
                 // Update RHINO environment variable in registry and local process.
+                path = string.Format("{0}Rhino.exe", path);
                 try { Environment.SetEnvironmentVariable("RHINO", path, EnvironmentVariableTarget.User); } catch { }
                 try { Environment.SetEnvironmentVariable("RHINO", path, EnvironmentVariableTarget.Process); } catch { }
                 steps.Add(string.Format("Set Rhino path to {0}", path));
