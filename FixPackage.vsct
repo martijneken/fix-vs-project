@@ -46,10 +46,22 @@
     <!--This section defines the elements the user can interact with, like a menu command or a button
         or combo box in a toolbar. -->
     <Buttons>
-      <Button guid="guidFixPackageCmdSet" id="FixButton" priority="0x0100" type="Button">
+      <Button guid="guidFixPackageCmdSet" id="FixComponent" priority="0x0100" type="Button">
         <Parent guid="guidFixPackageCmdSet" id="FixGroup" />
         <Strings>
-          <ButtonText>DigitalStructures: Fix Project</ButtonText>
+          <ButtonText>Fixup: Grasshopper Component</ButtonText>
+        </Strings>
+      </Button>
+      <Button guid="guidFixPackageCmdSet" id="FixLibrary" priority="0x0100" type="Button">
+        <Parent guid="guidFixPackageCmdSet" id="FixGroup" />
+        <Strings>
+          <ButtonText>Fixup: Grasshopper Shared Library</ButtonText>
+        </Strings>
+      </Button>
+      <Button guid="guidFixPackageCmdSet" id="FixNormal" priority="0x0100" type="Button">
+        <Parent guid="guidFixPackageCmdSet" id="FixGroup" />
+        <Strings>
+          <ButtonText>Fixup: non-Grasshopper Executable</ButtonText>
         </Strings>
       </Button>
     </Buttons>
@@ -62,7 +74,9 @@
     <!-- This is the guid used to group the menu commands together -->
     <GuidSymbol name="guidFixPackageCmdSet" value="{8cb843ec-7aa4-435f-bc30-3c03385091aa}">
       <IDSymbol name="FixGroup" value="0x1020" />
-      <IDSymbol name="FixButton" value="0x0100" />
+      <IDSymbol name="FixComponent" value="0x0100" />
+      <IDSymbol name="FixLibrary" value="0x0101" />
+      <IDSymbol name="FixNormal" value="0x0102" />
     </GuidSymbol>
   </Symbols>
 </CommandTable>

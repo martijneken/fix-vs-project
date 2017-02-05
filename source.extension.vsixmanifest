@@ -3,7 +3,7 @@
   <Metadata>
     <Identity Id="FixProject.Company.c487bfd6-c396-4bac-9736-0af056ad4a16" Version="1.0" Language="en-US" Publisher="Company" />
     <DisplayName>FixProject</DisplayName>
-    <Description>Empty VSIX Project.</Description>
+    <Description>Update build configuration for GrassHopper Projects</Description>
   </Metadata>
   <Installation>
     <InstallationTarget Id="Microsoft.VisualStudio.Community" Version="[14.0]" />

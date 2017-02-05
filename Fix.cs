@@ -3,6 +3,9 @@ using System.ComponentModel.Design;
 using Microsoft.VisualStudio.Shell;
 using Microsoft.VisualStudio.Shell.Interop;
 using System.Linq;
+using System.Collections.Generic;
+using System.IO;
+using Microsoft.Win32;
 
 namespace FixProject
 {
@@ -11,10 +14,9 @@ namespace FixProject
     /// </summary>
     internal sealed class Fix
     {
-        /// <summary>
-        /// Command ID.
-        /// </summary>
-        public const int CommandId = 0x0100;
+        public const int ComponentCommandId = 0x0100;
+        public const int LibraryCommandId = 0x0101;
+        public const int NormalCommandId = 0x0102;
 
         /// <summary>
         /// Command menu group (command set GUID).
@@ -43,12 +45,20 @@ namespace FixProject
             OleMenuCommandService commandService = this.ServiceProvider.GetService(typeof(IMenuCommandService)) as OleMenuCommandService;
             if (commandService != null)
             {
-                var menuCommandID = new CommandID(CommandSet, CommandId);
-                var menuItem = new MenuCommand(this.MenuItemCallback, menuCommandID);
-                commandService.AddCommand(menuItem);
+                // Fix as component
+                var componentCommand = new CommandID(CommandSet, ComponentCommandId);
+                commandService.AddCommand(new MenuCommand((sender, e) => this.FixProject(ProjectType.GHCOMPONENT), componentCommand));
+
+                // Fix as shared library
+                var libraryCommand = new CommandID(CommandSet, LibraryCommandId);
+                commandService.AddCommand(new MenuCommand((sender, e) => this.FixProject(ProjectType.GHLIBRARY), libraryCommand));
+                
+                // Fix as regular executable
+                var normalCommand = new CommandID(CommandSet, NormalCommandId);
+                commandService.AddCommand(new MenuCommand((sender, e) => this.FixProject(ProjectType.NONGHEXE), normalCommand));
             }
         }
-
+        
         /// <summary>
         /// Gets the instance of the command.
         /// </summary>
@@ -83,25 +93,27 @@ namespace FixProject
             return Package.GetGlobalService(typeof(EnvDTE.DTE)) as EnvDTE80.DTE2;
         }
 
-        private void ShowMessage(OLEMSGICON icon, string message)
+        public static string FullPath(string path)
         {
-            VsShellUtilities.ShowMessageBox(
-                this.ServiceProvider,
-                message,
-                "",
-                icon,
-                OLEMSGBUTTON.OLEMSGBUTTON_OK,
-                OLEMSGDEFBUTTON.OLEMSGDEFBUTTON_FIRST);
+            try
+            {
+                return Path.GetFullPath(new Uri(path).LocalPath)
+                       .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            }
+            catch
+            {
+                return path;
+            }
         }
 
-        /// <summary>
-        /// This function is the callback used to execute the command when the menu item is clicked.
-        /// See the constructor to see how the menu item is associated with this function using
-        /// OleMenuCommandService service and MenuCommand class.
-        /// </summary>
-        /// <param name="sender">Event sender.</param>
-        /// <param name="e">Event args.</param>
-        private void MenuItemCallback(object sender, EventArgs e)
+        enum ProjectType
+        {
+            GHCOMPONENT,
+            GHLIBRARY,
+            NONGHEXE,
+        };
+
+        private void FixProject(ProjectType type)
         {
             var app = GetDTE2();
 
@@ -131,36 +143,116 @@ namespace FixProject
                 ShowMessage(OLEMSGICON.OLEMSGICON_CRITICAL, "Error! project is not C#/VB: " + selection.Name);
                 return;
             }
+            var steps = new List<string>();
 
-            // Set launch action for all configurations.
-            foreach (EnvDTE.Configuration config in project.ConfigurationManager)
-            {
-                string path = config.Properties.Item("OutputPath").Value.ToString();
-                string projectdir = string.Concat(Enumerable.Repeat("..\\", path.Count(x => x == '\\')));
-                config.Properties.Item("StartAction").Value = VSLangProj.prjStartAction.prjStartActionProgram;
-                config.Properties.Item("StartProgram").Value = @"C:\WINDOWS\system32\cmd.exe";
-                config.Properties.Item("StartArguments").Value = @"/c start_rhino.bat";
-                config.Properties.Item("StartWorkingDirectory").Value = projectdir + @"..\Libraries\";
-            }
-
-            // Set copylocal false on all references.
+            // Set copylocal value on references to neighboring items:
+            // - set false on Rhino/Grasshopper DLLs
+            // - set true on any others (DLLs and projects)
+            // Non-grasshopper projects use the default value of True.
+            // Unloaded projects return an empty path, and won't be touched.
+            string parentdir = FullPath(Path.GetDirectoryName(project.FullName) + "\\..");
             foreach (VSLangProj.Reference r in vsproject.References)
             {
-                try { r.CopyLocal = false; } catch { }
+                bool nearby = FullPath(r.Path).StartsWith(parentdir, StringComparison.OrdinalIgnoreCase);
+                if (nearby)
+                {
+                    bool rhino = r.Path.IndexOf("rhino", StringComparison.OrdinalIgnoreCase) >= 0;
+                    bool grass = r.Path.IndexOf("grasshopper", StringComparison.OrdinalIgnoreCase) >= 0;
+                    bool copylocal = (!rhino && !grass) || type == ProjectType.NONGHEXE;
+                    try { r.CopyLocal = copylocal; } catch { }
+                    steps.Add(string.Format("Set CopyLocal = {0} for reference to {1}", copylocal, r.Name));
+                }
             }
 
-            // Set post build events (rename + copy).
-            string rename = @"MOVE /Y ""$(TargetPath)"" ""$(TargetDir)$(ProjectName).gha""";
-            string copy = @"XCOPY /Y /F ""$(TargetDir)$(ProjectName).*"" ""$(ProjectDir)..\Libraries\Output\""";
+            // Set post build events:
+            // - rename DLL if it's a component
+            // - always copy to ..\Output
+            var pbsteps = new List<string>();
+            if (type == ProjectType.GHCOMPONENT) 
+            {
+                pbsteps.Add(@"MOVE /Y ""$(TargetPath)"" ""$(TargetDir)$(ProjectName).gha""");
+                steps.Add(string.Format("Set PostBuild to rename {0}.dll to {0}.gha", project.Name));
+            }
+            if (type == ProjectType.GHCOMPONENT || type == ProjectType.GHLIBRARY)
+            {
+                pbsteps.Add(@"XCOPY /Y /F ""$(TargetDir)*"" ""$(ProjectDir)..\Output\""");
+                steps.Add("Set PostBuild to copy output to ..\\Output");
+            }
             var postbuild = project.Properties.Item("PostBuildEvent");
-            postbuild.Value = rename + " && " + copy;
+            postbuild.Value = string.Join(" && ", pbsteps);
+            
+            // Find the installation directory for Rhino, preferring 64-bit.
+            // See: http://developer.rhino3d.com/guides/cpp/finding-rhino-installation-folder/
+            string path = null;
+            const string RHINO = @"SOFTWARE\McNeel\Rhinoceros";
+            RegistryKey local =
+                RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, RegistryView.Registry64) ??
+                RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, RegistryView.Registry32);
+            RegistryKey key = local.OpenSubKey(RHINO);
+            if (key != null)
+            {
+                string[] subs = key.GetSubKeyNames();
+                if (subs.Length > 0)
+                {
+                    // Pick the last version directory, hoping to get the latest / newest install.
+                    string version = subs[subs.Length - 1];
+                    RegistryKey subkey = local.OpenSubKey(string.Format(@"{0}\{1}\Install", RHINO, version));
+                    if (subkey != null)
+                    {
+                        object o = subkey.GetValue("Path");
+                        path = o as string;
+                    }
+                }
+            }
+            // Set the project to launch Rhino when debugging.
+            if (path != null)
+            {
+                // Update RHINO environment variable in registry and local process.
+                try { Environment.SetEnvironmentVariable("RHINO", path, EnvironmentVariableTarget.User); } catch { }
+                try { Environment.SetEnvironmentVariable("RHINO", path, EnvironmentVariableTarget.Process); } catch { }
+                steps.Add(string.Format("Set Rhino path to {0}", path));
+
+                // Set Rhino launch action for all configurations.
+                bool rhino = type != ProjectType.NONGHEXE;
+                foreach (EnvDTE.Configuration config in project.ConfigurationManager)
+                {
+                    if (rhino)
+                    {
+                        config.Properties.Item("StartAction").Value = VSLangProj.prjStartAction.prjStartActionProgram;
+                        config.Properties.Item("StartProgram").Value = @"$(RHINO)";
+                    }
+                    else
+                    {
+                        config.Properties.Item("StartAction").Value = VSLangProj.prjStartAction.prjStartActionProject;
+                        config.Properties.Item("StartProgram").Value = null;
+                    }
+                    config.Properties.Item("StartArguments").Value = null;
+                    config.Properties.Item("StartWorkingDirectory").Value = null;
+                }
+                steps.Add(string.Format("Set debugging action to launch {0}", rhino ? "Rhino" : "Project"));
+            }
 
             // Communicate success.
-            ShowMessage(OLEMSGICON.OLEMSGICON_INFO, "Updated project:\r\n" +
-                "\r\n- Set all copylocal = false" +
-                "\r\n- Set-post build rename to GHA" +
-                "\r\n- Set-post build copy to Libraries\\Output" +
-                "\r\n- Set start action to open Rhino");
+            string desc;
+            switch (type)
+            {
+                case ProjectType.GHCOMPONENT: desc = "Grasshopper Component"; break;
+                case ProjectType.GHLIBRARY: desc = "Grasshopper Shared Library"; break;
+                default: desc = "Non-Grasshopper Executable"; break;
+            }
+            steps.Insert(0, string.Format("Updated project as {0}\r\n", desc));
+            ShowMessage(OLEMSGICON.OLEMSGICON_INFO, string.Join("\r\n- ", steps));
+        }
+
+        private void ShowMessage(OLEMSGICON icon, string message)
+        {
+            VsShellUtilities.ShowMessageBox(
+                this.ServiceProvider,
+                message,
+                "",
+                icon,
+                OLEMSGBUTTON.OLEMSGBUTTON_OK,
+                OLEMSGDEFBUTTON.OLEMSGDEFBUTTON_FIRST);
         }
     }
 }
