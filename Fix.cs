@@ -1,11 +1,11 @@
-﻿using System;
-using System.ComponentModel.Design;
-using Microsoft.VisualStudio.Shell;
+﻿using Microsoft.VisualStudio.Shell;
 using Microsoft.VisualStudio.Shell.Interop;
-using System.Linq;
+using Microsoft.Win32;
+using System;
+using System.ComponentModel.Design;
 using System.Collections.Generic;
 using System.IO;
-using Microsoft.Win32;
+using System.Xml;
 
 namespace FixProject
 {
@@ -92,20 +92,7 @@ namespace FixProject
         {
             return Package.GetGlobalService(typeof(EnvDTE.DTE)) as EnvDTE80.DTE2;
         }
-
-        public static string FullPath(string path)
-        {
-            try
-            {
-                return Path.GetFullPath(new Uri(path).LocalPath)
-                       .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
-            }
-            catch
-            {
-                return path;
-            }
-        }
-
+        
         enum ProjectType
         {
             GHCOMPONENT,
@@ -180,10 +167,10 @@ namespace FixProject
             }
             var postbuild = project.Properties.Item("PostBuildEvent");
             postbuild.Value = string.Join(" && ", pbsteps);
-            
-            // Find the installation directory for Rhino, preferring 64-bit.
+
+            // Set the Rhino path as an environment variable (RHINO).
+            // Find the installation directory from the registry, preferring 64-bit.
             // See: http://developer.rhino3d.com/guides/cpp/finding-rhino-installation-folder/
-            string path = null;
             const string RHINO = @"SOFTWARE\McNeel\Rhinoceros";
             RegistryKey local =
                 RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, RegistryView.Registry64) ??
@@ -199,39 +186,36 @@ namespace FixProject
                     RegistryKey subkey = local.OpenSubKey(string.Format(@"{0}\{1}\Install", RHINO, version));
                     if (subkey != null)
                     {
-                        object o = subkey.GetValue("Path");
-                        path = o as string;
+                        string dir = subkey.GetValue("Path") as string;
+                        if (dir != null)
+                        {
+                            // Update RHINO environment variable in registry and local process.
+                            string path = string.Format("{0}Rhino.exe", dir);
+                            try { Environment.SetEnvironmentVariable("RHINO", path, EnvironmentVariableTarget.User); } catch { }
+                            try { Environment.SetEnvironmentVariable("RHINO", path, EnvironmentVariableTarget.Process); } catch { }
+                            steps.Add(string.Format("Set Rhino path to {0}", path));
+                        }
                     }
                 }
             }
-            // Set the project to launch Rhino when debugging.
-            if (path != null)
-            {
-                // Update RHINO environment variable in registry and local process.
-                path = string.Format("{0}Rhino.exe", path);
-                try { Environment.SetEnvironmentVariable("RHINO", path, EnvironmentVariableTarget.User); } catch { }
-                try { Environment.SetEnvironmentVariable("RHINO", path, EnvironmentVariableTarget.Process); } catch { }
-                steps.Add(string.Format("Set Rhino path to {0}", path));
 
-                // Set Rhino launch action for all configurations.
-                bool rhino = type != ProjectType.NONGHEXE;
-                foreach (EnvDTE.Configuration config in project.ConfigurationManager)
-                {
-                    if (rhino)
-                    {
-                        config.Properties.Item("StartAction").Value = VSLangProj.prjStartAction.prjStartActionProgram;
-                        config.Properties.Item("StartProgram").Value = @"$(RHINO)";
-                    }
-                    else
-                    {
-                        config.Properties.Item("StartAction").Value = VSLangProj.prjStartAction.prjStartActionProject;
-                        config.Properties.Item("StartProgram").Value = null;
-                    }
-                    config.Properties.Item("StartArguments").Value = null;
-                    config.Properties.Item("StartWorkingDirectory").Value = null;
-                }
-                steps.Add(string.Format("Set debugging action to launch {0}", rhino ? "Rhino" : "Project"));
+            // Save pending changes before editing the project file directly.
+            project.Save();
+
+            // Set the project launch action: Project itself or Rhino.
+            // I tried using project.ConfigurationManager at first, but...
+            // - it saves changes to every specific Configuration, in csproj.user files
+            // - it escapes strings on write, turning $(RHINO) into %24%28RHINO%29 (useless)
+            bool program = type != ProjectType.NONGHEXE;
+            if (program)
+            {
+                UpdateProjectStartAction(project.FullName, "Program", "$(RHINO)", null, null);
             }
+            else
+            {
+                UpdateProjectStartAction(project.FullName, "Project", null, null, null);
+            }
+            steps.Add(string.Format("Set debugging action to launch {0}", program ? "Rhino" : "Project"));
 
             // Communicate success.
             string desc;
@@ -254,6 +238,78 @@ namespace FixProject
                 icon,
                 OLEMSGBUTTON.OLEMSGBUTTON_OK,
                 OLEMSGDEFBUTTON.OLEMSGDEFBUTTON_FIRST);
+        }
+
+        /// <summary>
+        /// Helper to get an absolute path, no trailing slash.
+        /// </summary>
+        /// <param name="path"></param>
+        /// <returns></returns>
+        private static string FullPath(string path)
+        {
+            try
+            {
+                return Path.GetFullPath(new Uri(path).LocalPath)
+                       .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            }
+            catch
+            {
+                return path;
+            }
+        }
+
+        /// <summary>
+        /// Helper to update the contents of a VB/CS project file.
+        /// </summary>
+        /// <param name="path"></param>
+        /// <param name="action"></param>
+        /// <param name="program"></param>
+        /// <param name="args"></param>
+        /// <param name="dir"></param>
+        private static void UpdateProjectStartAction(string path, string action, string program, string args, string dir)
+        {
+            XmlDocument doc = new XmlDocument();
+            doc.Load(path);
+            string before = doc.OuterXml;
+
+            // Add namespace.
+            const string NS = "http://schemas.microsoft.com/developer/msbuild/2003";
+            XmlNamespaceManager ns = new XmlNamespaceManager(doc.NameTable);
+            ns.AddNamespace("x", NS);
+
+            // Get root Project node.
+            XmlElement proj = doc.DocumentElement;
+
+            // See if the project file matches our expectations.
+            XmlNodeList nodes = proj.SelectNodes("//x:PropertyGroup[x:StartAction]", ns);
+
+            // Remove all existing launch actions.
+            foreach (XmlNode n in nodes)
+            {
+                n.ParentNode.RemoveChild(n);
+            }
+
+            // Add a new launch action, if requested.
+            if (action != null)
+            {
+                var pg = doc.CreateElement("PropertyGroup", NS);
+                var sa = pg.AppendChild(doc.CreateElement("StartAction", NS));
+                var sp = pg.AppendChild(doc.CreateElement("StartProgram", NS));
+                var sg = pg.AppendChild(doc.CreateElement("StartArguments", NS));
+                var sd = pg.AppendChild(doc.CreateElement("StartWorkingDirectory", NS));
+                sa.InnerText = action;
+                if (program != null) { sp.InnerText = program; }
+                if (args != null) { sg.InnerText = args; }
+                if (dir != null) { sd.InnerText = dir; }
+                proj.AppendChild(pg);
+            }
+
+            // Prevent file writes where possible.
+            string after = doc.OuterXml;
+            if (before != after)
+            {
+                doc.Save(path);
+            }
         }
     }
 }
